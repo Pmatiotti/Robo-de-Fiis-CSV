@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import Iterable
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
 
 KEY_COLUMNS = ["CNPJ_Fundo_Classe", "Data_Referencia", "Versao"]
@@ -19,21 +19,6 @@ NUMERIC_COLUMNS = [
     "Rendimento_Cota",
     "Preco_Cota",
 ]
-
-
-@dataclass(frozen=True)
-class SupabaseConfig:
-    url: str
-    anon_key: str
-    ingest_api_key: str
-
-    @staticmethod
-    def from_env() -> "SupabaseConfig":
-        return SupabaseConfig(
-            url=os.environ["SUPABASE_URL"].rstrip("/"),
-            anon_key=os.environ["SUPABASE_ANON_KEY"],
-            ingest_api_key=os.environ["INGEST_API_KEY"],
-        )
 
 
 def _read_csv(path: str) -> pd.DataFrame:
@@ -78,57 +63,46 @@ def _asset_class_from_row(row: pd.Series) -> str:
     return "fii"
 
 
-def _fetch_registry_mapping(config: SupabaseConfig) -> dict[str, str]:
-    url = f"{config.url}/rest/v1/fii_registry"
-    params = {"select": "cnpj,ticker"}
-    headers = {"apikey": config.anon_key, "Authorization": f"Bearer {config.anon_key}"}
-    response = requests.get(url, headers=headers, params=params, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    return {item["cnpj"]: item["ticker"] for item in data if item.get("cnpj") and item.get("ticker")}
+
+def _load_env() -> tuple[str, str]:
+    load_dotenv()
+    ingest_url = os.environ["MONIITOR_INGEST_URL"].rstrip("/")
+    ingest_api_key = os.environ["INGEST_API_KEY"]
+    return ingest_url, ingest_api_key
 
 
-def _post_current_data(config: SupabaseConfig, payloads: list[dict]) -> None:
-    url = f"{config.url}/functions/v1/ingest-fundamental-data"
-    headers = {"x-api-key": config.ingest_api_key, "Content-Type": "application/json"}
-    session = requests.Session()
-    for payload in payloads:
-        response = session.post(url, headers=headers, json={"data": payload}, timeout=30)
-        response.raise_for_status()
-
-
-def _post_history(config: SupabaseConfig, endpoint: str, records: list[dict]) -> None:
+def send_to_ingest_function(
+    ingest_url: str,
+    ingest_api_key: str,
+    data_type: str,
+    records: list[dict],
+) -> None:
     if not records:
         return
-    url = f"{config.url}{endpoint}"
-    headers = {
-        "apikey": config.anon_key,
-        "Authorization": f"Bearer {config.anon_key}",
-        "Prefer": "resolution=merge-duplicates",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(url, headers=headers, json=records, timeout=30)
+    headers = {"x-api-key": ingest_api_key, "Content-Type": "application/json"}
+    payload = {"type": data_type, "data": records}
+    response = requests.post(ingest_url, headers=headers, json=payload, timeout=30)
     response.raise_for_status()
 
 
-def _build_current_payloads(df: pd.DataFrame, ticker_map: dict[str, str]) -> list[dict]:
+def _build_current_payloads(df: pd.DataFrame) -> list[dict]:
     latest_dates = df.groupby("CNPJ_Fundo_Classe")["Data_Referencia"].max()
     latest_df = df.join(latest_dates, on="CNPJ_Fundo_Classe", rsuffix="_max")
     latest_df = latest_df[latest_df["Data_Referencia"] == latest_df["Data_Referencia_max"]]
 
     payloads = []
     for _, row in latest_df.iterrows():
-        ticker = ticker_map.get(row["CNPJ_Fundo_Classe"])
-        if not ticker:
-            continue
         patrimonio = _get_first_value(row, ["Patrimonio_Liquido"])
         cotas = _get_first_value(row, ["Cotas_Emitidas"])
         vpa = patrimonio / cotas if patrimonio and cotas else None
         num_cotistas = _get_first_value(row, ["Numero_Cotistas"])
         payloads.append(
             {
-                "ticker": ticker,
+                "cnpj_fundo_classe": row["CNPJ_Fundo_Classe"],
                 "asset_class": _asset_class_from_row(row),
+                "data_referencia": row["Data_Referencia"].date().isoformat()
+                if pd.notna(row["Data_Referencia"])
+                else None,
                 "patrimonio_liquido": patrimonio,
                 "valor_patrimonial_cota": vpa,
                 "num_cotistas": num_cotistas,
@@ -137,12 +111,9 @@ def _build_current_payloads(df: pd.DataFrame, ticker_map: dict[str, str]) -> lis
     return payloads
 
 
-def _build_vp_history(df: pd.DataFrame, ticker_map: dict[str, str]) -> list[dict]:
+def _build_vp_history(df: pd.DataFrame) -> list[dict]:
     records = []
     for _, row in df.iterrows():
-        ticker = ticker_map.get(row["CNPJ_Fundo_Classe"])
-        if not ticker:
-            continue
         patrimonio = _get_first_value(row, ["Patrimonio_Liquido"])
         cotas = _get_first_value(row, ["Cotas_Emitidas"])
         price = _get_first_value(row, ["Preco_Cota"])
@@ -150,7 +121,7 @@ def _build_vp_history(df: pd.DataFrame, ticker_map: dict[str, str]) -> list[dict
         p_vp = price / vpa if price and vpa else None
         records.append(
             {
-                "ticker": ticker,
+                "cnpj_fundo_classe": row["CNPJ_Fundo_Classe"],
                 "data_referencia": row["Data_Referencia"].date().isoformat()
                 if pd.notna(row["Data_Referencia"])
                 else None,
@@ -163,19 +134,16 @@ def _build_vp_history(df: pd.DataFrame, ticker_map: dict[str, str]) -> list[dict
     return records
 
 
-def _build_dividend_history(df: pd.DataFrame, ticker_map: dict[str, str]) -> list[dict]:
+def _build_dividend_history(df: pd.DataFrame) -> list[dict]:
     dividend_columns = ["Rendimento_Distribuido", "Rendimento_Cota", "Dividendos_Distribuidos"]
     records = []
     for _, row in df.iterrows():
-        ticker = ticker_map.get(row["CNPJ_Fundo_Classe"])
-        if not ticker:
-            continue
         dividend = _get_first_value(row, dividend_columns)
         if not dividend:
             continue
         records.append(
             {
-                "ticker": ticker,
+                "cnpj_fundo_classe": row["CNPJ_Fundo_Classe"],
                 "data_referencia": row["Data_Referencia"].date().isoformat()
                 if pd.notna(row["Data_Referencia"])
                 else None,
@@ -186,7 +154,7 @@ def _build_dividend_history(df: pd.DataFrame, ticker_map: dict[str, str]) -> lis
 
 
 def process_cvm_files(path_geral: str, path_ativo: str, path_complemento: str) -> None:
-    config = SupabaseConfig.from_env()
+    ingest_url, ingest_api_key = _load_env()
 
     geral = _read_csv(path_geral)
     ativo = _read_csv(path_ativo)
@@ -197,15 +165,13 @@ def process_cvm_files(path_geral: str, path_ativo: str, path_complemento: str) -
     df = _coerce_numeric(df, NUMERIC_COLUMNS)
     df = _filter_latest_versions(df)
 
-    ticker_map = _fetch_registry_mapping(config)
+    current_payloads = _build_current_payloads(df)
+    vp_history = _build_vp_history(df)
+    dividend_history = _build_dividend_history(df)
 
-    current_payloads = _build_current_payloads(df, ticker_map)
-    vp_history = _build_vp_history(df, ticker_map)
-    dividend_history = _build_dividend_history(df, ticker_map)
-
-    _post_current_data(config, current_payloads)
-    _post_history(config, "/rest/v1/fii_metrics", vp_history)
-    _post_history(config, "/rest/v1/fii_dividends", dividend_history)
+    send_to_ingest_function(ingest_url, ingest_api_key, "current", current_payloads)
+    send_to_ingest_function(ingest_url, ingest_api_key, "metrics", vp_history)
+    send_to_ingest_function(ingest_url, ingest_api_key, "dividends", dividend_history)
 
 
 if __name__ == "__main__":
